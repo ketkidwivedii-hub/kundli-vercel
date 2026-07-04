@@ -1,20 +1,15 @@
 // pages/api/match.js
 // Orchestrates the full check: location eligibility (pure JS, no external
 // call) + kundli score (calls the Python engine deployed separately, since
-// the precise astronomical calculation lives there — see backend/ folder,
+// the precise astronomical calculation lives there -- see backend/ folder,
 // deployed on Render). Requires BACKEND_URL to be set as an environment
 // variable pointing at that deployed service.
 //
-// DEBUG NOTE (fix for "Unexpected token '<'" error): that error means
-// something in this chain returned HTML instead of JSON. The most likely
-// cause is Render's free tier "cold start" — if the backend has been idle,
-// it can take 30-60s to wake up, and Vercel's own function can time out
-// waiting on it first, returning Vercel's own HTML error page (not
-// anything from the Python backend). Fixed by: (1) reading every response
-// as text first and only parsing as JSON if it looks like JSON, so a
-// timeout or error page produces a clear message instead of a crash, and
-// (2) raising this function's own timeout so it can actually wait out a
-// Render cold start instead of giving up first.
+// Geocoding is called via the shared lib/geocode.js function directly --
+// NOT via an internal fetch("/api/geocode") call. Self-invoking your own
+// API route from inside a Vercel serverless function is fragile and was
+// returning an HTML fallback page instead of JSON; importing the plain
+// function removes that failure mode entirely.
 
 export const config = {
   maxDuration: 60, // give Render's cold start room to finish (Vercel Hobby max)
@@ -22,6 +17,7 @@ export const config = {
 
 import { checkLocationEligibilityByText, checkLocationEligibilityByState } from "../../lib/locationRules";
 import { OWNER_PROFILE } from "../../lib/ownerProfile";
+import { geocodePlace } from "../../lib/geocode";
 
 // Reads a fetch Response as text first, then attempts JSON.parse. Throws a
 // clear, diagnosable error (including a snippet of the raw body) instead of
@@ -40,17 +36,6 @@ async function safeJson(res, label) {
   return { ok: res.ok, status: res.status, data };
 }
 
-async function geocode(place, origin) {
-  const res = await fetch(`${origin}/api/geocode`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ place }),
-  });
-  const { ok, data } = await safeJson(res, "Internal geocode API");
-  if (!ok) throw new Error(data.error || "Geocoding failed");
-  return data;
-}
-
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Use POST" });
@@ -61,15 +46,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing 'fields' in request body" });
   }
 
-  const origin = `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}`;
-
   // ---- Step 1: location eligibility ----
   let location;
   if (!fields.permanentAddress || !fields.permanentAddress.trim()) {
     location = { passed: null, reason: "No permanent address was provided, so this check could not run.", matchedState: null };
   } else {
     try {
-      const geo = await geocode(fields.permanentAddress, origin);
+      const geo = await geocodePlace(fields.permanentAddress);
       location = checkLocationEligibilityByState(geo.state, fields.permanentAddress);
     } catch (err) {
       console.error("Location geocode failed, falling back to text match:", err.message || err);
@@ -86,7 +69,7 @@ export default async function handler(req, res) {
     kundli.reason = "The kundli calculation service isn't connected yet (BACKEND_URL environment variable is not set). Deploy the /backend service and add its URL in Vercel's environment variables.";
   } else {
     try {
-      const geo = await geocode(fields.birthLocation, origin);
+      const geo = await geocodePlace(fields.birthLocation);
       const prospect = {
         name: fields.fullName || "Prospect",
         dob: fields.dob,
@@ -143,7 +126,7 @@ export default async function handler(req, res) {
     decisionText = "Basic criteria passed, but review manually.";
   } else if (!kundli.available && location.passed !== false) {
     decision = "AVERAGE_MATCH";
-    decisionText = "Location check passed, but kundli score could not be calculated — review manually.";
+    decisionText = "Location check passed, but kundli score could not be calculated -- review manually.";
   }
 
   return res.status(200).json({ location, kundli, decision, decisionText });
